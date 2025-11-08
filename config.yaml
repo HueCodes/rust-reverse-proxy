@@ -1,0 +1,28 @@
+server:
+  host: "127.0.0.1"
+  port: 3000
+
+backends:
+  - url: "http://httpbin.org"
+    weight: 1
+    health_check_path: "/status/200"
+  - url: "http://example.com"
+    weight: 1
+    health_check_path: "/"
+
+load_balancing:
+  strategy: "round_robin"  # round_robin, weighted_round_robin, least_connections
+
+health_checks:
+  enabled: true
+  interval_seconds: 30
+  timeout_seconds: 5
+  failure_threshold: 3
+
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"  # json, text
+
+timeouts:
+  request_timeout_seconds: 30
+  connect_timeout_seconds: 10
