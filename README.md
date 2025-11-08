@@ -1,158 +1,180 @@
 # Rust Reverse Proxy
 
-[![Rust](https://github.com/HueCodes/rust-reverse-proxy/actions/workflows/rust.yml/badge.svg)](https://github.com/HueCodes/rust-reverse-proxy/actions/workflows/rust.yml)
-[![Crates.io](https://img.shields.io/crates/v/rust-reverse-proxy.svg)](https://crates.io/crates/rust-reverse-proxy)
-
-A lightweight and fast HTTP reverse proxy written in Rust. This project leverages the [Warp](https://github.com/seanmonstar/warp) framework for efficient request handling and routing, providing a simple yet powerful solution for proxying HTTP traffic.
+A lightweight, high-performance HTTP reverse proxy written in Rust, prioritizing security, memory safety, and concurrency.
 
 ## Features
 
-- **High Performance**: Built with Rust's zero-cost abstractions and async runtime for low-latency proxying.
-- **Flexible Routing**: Supports multiple upstream backends with easy configuration.
-- **TLS Support**: Optional TLS termination and forwarding (planned).
-- **Logging and Metrics**: Built-in structured logging and basic metrics (in development).
-- **Configurable**: YAML or TOML-based configuration for backends, filters, and middleware.
+- **High Performance**: Built with Tokio and Hyper for maximum throughput
+- **Load Balancing**: Round-robin load balancing across multiple backend servers
+- **Health Checks**: Automatic health monitoring of backend servers
+- **Configuration-Driven**: YAML-based configuration for easy management
+- **Structured Logging**: Comprehensive request/response logging with configurable levels
+- **Fault Tolerance**: Automatic failover and error handling
+- **Request Timeouts**: Configurable timeouts for reliability
+- **Header Forwarding**: Proper X-Forwarded-* headers for backend services
 
 ## Quick Start
 
-### Prerequisites
+1. **Build the project**:
+   ```bash
+   cargo build --release
+   ```
 
-- Rust 1.70+ (stable)
-- Cargo
+2. **Configure your backends** in `config.yaml`:
+   ```yaml
+   server:
+     host: "127.0.0.1"
+     port: 3000
+   
+   backends:
+     - url: "http://backend1.example.com"
+       weight: 1
+       health_check_path: "/health"
+     - url: "http://backend2.example.com"
+       weight: 1  
+       health_check_path: "/health"
+   ```
 
-### Installation
-
-Clone the repository and build with Cargo:
-
-```bash
-git clone https://github.com/HueCodes/rust-reverse-proxy.git
-cd rust-reverse-proxy
-cargo build --release
-```
-
-### Running the Proxy
-
-Create a basic configuration file `config.yaml`:
-
-```yaml
-backends:
-  - name: "api"
-    host: "http://localhost:8080"
-    path_prefix: "/api"
-  - name: "web"
-    host: "http://localhost:3000"
-    path_prefix: "/"
-
-port: 80
-```
-
-Start the proxy:
-
-```bash
-cargo run -- --config config.yaml
-```
-
-Or with the release binary:
-
-```bash
-./target/release/rust-reverse-proxy --config config.yaml
-```
-
-The proxy will listen on port 80 and forward requests to the configured backends based on path prefixes.
+3. **Run the proxy**:
+   ```bash
+   cargo run --release
+   ```
 
 ## Configuration
 
-The proxy uses a YAML configuration file. Key sections:
-
-- `backends`: List of upstream services with `name`, `host`, `path_prefix`, and optional `strip_prefix`.
-- `port`: Listening port (default: 80).
-- `log_level`: Logging verbosity (e.g., "info", "debug").
-- `tls`: TLS configuration (cert and key paths, enabled by default if provided).
-
-For full options, see `config.yaml.example` (to be added).
-
-## Usage Examples
-
-### Basic Proxying
-
-Proxy all `/api/*` requests to `http://backend:8080`:
+The proxy is configured using a `config.yaml` file:
 
 ```yaml
+server:
+  host: "127.0.0.1"      # Interface to bind to
+  port: 3000             # Port to listen on
+
 backends:
-  - name: "backend"
-    host: "http://backend:8080"
-    path_prefix: "/api"
+  - url: "http://httpbin.org"       # Backend server URL
+    weight: 1                       # Load balancing weight
+    health_check_path: "/status/200" # Health check endpoint
+  - url: "http://example.com"
+    weight: 1
+    health_check_path: "/"
+
+load_balancing:
+  strategy: "round_robin"  # Load balancing strategy
+
+health_checks:
+  enabled: true           # Enable/disable health checks
+  interval_seconds: 30    # Health check interval
+  timeout_seconds: 5      # Health check timeout
+  failure_threshold: 3    # Failures before marking unhealthy
+
+logging:
+  level: "info"          # Log level (debug, info, warn, error)
+  format: "json"         # Log format (json, text)
+
+timeouts:
+  request_timeout_seconds: 30   # Backend request timeout
+  connect_timeout_seconds: 10   # Connection timeout
 ```
 
-### Load Balancing
+## Architecture
 
-Support for round-robin load balancing across multiple hosts (planned feature):
+The proxy consists of several key components:
 
-```yaml
-backends:
-  - name: "api-cluster"
-    hosts:
-      - "http://backend1:8080"
-      - "http://backend2:8080"
-    path_prefix: "/api"
-    strategy: "round_robin"
-```
+- **ProxyService**: Main request handling service
+- **LoadBalancer**: Manages backend selection and health status
+- **HealthChecker**: Monitors backend server health
+- **Configuration**: YAML-based configuration management
 
-### Middleware
+## Load Balancing
 
-Add rate limiting or authentication middleware via configuration (in development).
+Currently supports round-robin load balancing:
+- Requests are distributed evenly across healthy backends
+- Unhealthy backends are automatically excluded
+- Backends are marked unhealthy after consecutive failures
+
+## Health Checks
+
+- Periodic health checks to all configured backends
+- Configurable health check paths and intervals
+- Automatic failover when backends become unhealthy
+- Recovery detection when backends come back online
+
+## Logging
+
+Structured logging with configurable levels:
+- Request/response logging with timing information
+- Health check status updates
+- Error tracking and debugging information
+- JSON or plain text output formats
+
+## Error Handling
+
+Robust error handling with appropriate HTTP status codes:
+- `503 Service Unavailable`: No healthy backends
+- `502 Bad Gateway`: Backend request failures
+- `504 Gateway Timeout`: Backend request timeouts
+- `400 Bad Request`: Client request issues
+
+## Performance
+
+Optimized for high performance:
+- Async/await with Tokio runtime
+- Connection pooling with Hyper client
+- Zero-copy request/response forwarding where possible
+- Minimal memory allocations
 
 ## Development
 
-This project is actively under development. Current focus:
-
-- Implementing core proxy logic with Warp.
-- Adding configuration parsing.
-- TLS integration with Rustls.
-
-### Building and Testing
-
+### Building
 ```bash
-# Run tests
-cargo test
-
-# Run with clippy
-cargo clippy -- -D warnings
-
-# Format code
-cargo fmt
+cargo build
 ```
 
-### Dependencies
+### Testing
+```bash
+cargo test
+```
 
-See `Cargo.toml` for details. Key crates:
+### Running with Debug Logging
+```bash
+RUST_LOG=debug cargo run
+```
 
-- `warp`: Web server framework.
-- `tokio`: Async runtime.
-- `serde`: Configuration serialization.
-- `tracing`: Logging.
+## Docker Support
+
+Create a `Dockerfile`:
+```dockerfile
+FROM rust:1.70 AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/reverse_proxy /usr/local/bin/
+COPY config.yaml /etc/reverse-proxy/
+WORKDIR /etc/reverse-proxy
+EXPOSE 3000
+CMD ["reverse_proxy"]
+```
 
 ## Contributing
 
-Contributions are welcome! Please:
-
-1. Fork the repository.
-2. Create a feature branch (`git checkout -b feature/my-feature`).
-3. Commit changes (`git commit -am 'Add my feature'`).
-4. Push to the branch (`git push origin feature/my-feature`).
-5. Open a Pull Request.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for more details (to be created).
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Acknowledgments
+## Roadmap
 
-- Inspired by various Rust web projects and the need for a simple, performant proxy.
-- Thanks to the Warp and Tokio teams for excellent crates.
-
----
-
-*Project started in 2025. More features coming soon!*
+- [ ] HTTPS/TLS termination support
+- [ ] WebSocket proxying
+- [ ] Metrics and monitoring endpoints
+- [ ] Rate limiting
+- [ ] Path-based routing
+- [ ] Circuit breaker pattern
+- [ ] Admin API for runtime configuration

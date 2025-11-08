@@ -1,0 +1,29 @@
+# Example configuration for development
+server:
+  host: "127.0.0.1"
+  port: 8080
+
+backends:
+  - url: "http://httpbin.org"
+    weight: 2
+    health_check_path: "/status/200"
+  - url: "http://jsonplaceholder.typicode.com"
+    weight: 1
+    health_check_path: "/posts/1"
+
+load_balancing:
+  strategy: "round_robin"
+
+health_checks:
+  enabled: true
+  interval_seconds: 15
+  timeout_seconds: 3
+  failure_threshold: 2
+
+logging:
+  level: "debug"
+  format: "text"
+
+timeouts:
+  request_timeout_seconds: 20
+  connect_timeout_seconds: 5
