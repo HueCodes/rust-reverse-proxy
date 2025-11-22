@@ -1,17 +1,36 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioIo;
-use http_body_util::{BodyExt, Full};
-use tokio::net::TcpListener;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use log::{debug, error, info, warn};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use anyhow::{Context, Result};
-use log::{info, warn, error, debug};
-use serde::Deserialize;
-use chrono::{DateTime, Utc};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+
+type HttpClient = hyper_util::client::legacy::Client<HttpConnector, Full<Bytes>>;
+
+#[derive(Debug, Clone, Copy)]
+enum LoadBalancingStrategy {
+    RoundRobin,
+    WeightedRoundRobin,
+}
+
+impl LoadBalancingStrategy {
+    fn from_config(strategy: &str) -> Self {
+        match strategy.to_lowercase().as_str() {
+            "weighted_round_robin" => LoadBalancingStrategy::WeightedRoundRobin,
+            _ => LoadBalancingStrategy::RoundRobin,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
@@ -61,9 +80,19 @@ struct TimeoutConfig {
     connect_timeout_seconds: u64,
 }
 
+fn build_http_client(connect_timeout_seconds: u64) -> HttpClient {
+    let mut connector = HttpConnector::new();
+
+    if connect_timeout_seconds > 0 {
+        connector.set_connect_timeout(Some(Duration::from_secs(connect_timeout_seconds)));
+    }
+
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build::<_, Full<Bytes>>(connector)
+}
+
 #[derive(Debug, Clone)]
 struct BackendHealth {
-    url: String,
     healthy: bool,
     failures: u32,
     last_check: Option<DateTime<Utc>>,
@@ -74,59 +103,97 @@ struct LoadBalancer {
     backends: Vec<Backend>,
     health_status: Arc<tokio::sync::RwLock<HashMap<String, BackendHealth>>>,
     round_robin_counter: AtomicUsize,
+    strategy: LoadBalancingStrategy,
+    http_client: HttpClient,
 }
 
 impl LoadBalancer {
-    fn new(backends: Vec<Backend>) -> Self {
+    fn new(
+        backends: Vec<Backend>,
+        strategy: LoadBalancingStrategy,
+        connect_timeout_seconds: u64,
+    ) -> Self {
         let health_status = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        
+
         // Initialize health status for all backends
         {
             let mut health = health_status.blocking_write();
             for backend in &backends {
-                health.insert(backend.url.clone(), BackendHealth {
-                    url: backend.url.clone(),
-                    healthy: true, // Assume healthy initially
-                    failures: 0,
-                    last_check: None,
-                });
+                health.insert(
+                    backend.url.clone(),
+                    BackendHealth {
+                        healthy: true, // Assume healthy initially
+                        failures: 0,
+                        last_check: None,
+                    },
+                );
             }
         }
+
+        // Create reusable HTTP client
+        let http_client = build_http_client(connect_timeout_seconds);
 
         Self {
             backends,
             health_status,
             round_robin_counter: AtomicUsize::new(0),
+            strategy,
+            http_client,
         }
     }
 
     async fn get_healthy_backend(&self) -> Option<Backend> {
         let health = self.health_status.read().await;
-        let healthy_backends: Vec<&Backend> = self.backends
+        let healthy_backends: Vec<&Backend> = self
+            .backends
             .iter()
-            .filter(|backend| {
-                health.get(&backend.url)
-                    .map(|h| h.healthy)
-                    .unwrap_or(true)
-            })
+            .filter(|backend| health.get(&backend.url).map(|h| h.healthy).unwrap_or(true))
             .collect();
 
         if healthy_backends.is_empty() {
             return None;
         }
 
-        // Round-robin selection
-        let index = self.round_robin_counter.fetch_add(1, Ordering::SeqCst) % healthy_backends.len();
-        Some(healthy_backends[index].clone())
+        let selection = match self.strategy {
+            LoadBalancingStrategy::RoundRobin => {
+                let index = self.round_robin_counter.fetch_add(1, Ordering::SeqCst)
+                    % healthy_backends.len();
+                healthy_backends[index]
+            }
+            LoadBalancingStrategy::WeightedRoundRobin => {
+                let total_weight: usize = healthy_backends
+                    .iter()
+                    .map(|backend| backend.weight.max(1) as usize)
+                    .sum();
+
+                let position =
+                    self.round_robin_counter.fetch_add(1, Ordering::SeqCst) % total_weight.max(1);
+                let mut cumulative = 0usize;
+
+                healthy_backends
+                    .iter()
+                    .find(|backend| {
+                        cumulative += backend.weight.max(1) as usize;
+                        position < cumulative
+                    })
+                    .copied()
+                    .unwrap_or(healthy_backends[0])
+            }
+        };
+
+        Some(selection.clone())
     }
 
-    async fn mark_backend_unhealthy(&self, url: &str) {
+    async fn mark_backend_unhealthy(&self, url: &str, failure_threshold: u32) {
         let mut health = self.health_status.write().await;
         if let Some(backend_health) = health.get_mut(url) {
             backend_health.failures += 1;
-            if backend_health.failures >= 3 {
+            if backend_health.failures >= failure_threshold {
                 backend_health.healthy = false;
-                warn!("Backend {} marked as unhealthy after {} failures", url, backend_health.failures);
+                warn!(
+                    "Backend {} marked as unhealthy after {} failures",
+                    url, backend_health.failures
+                );
             }
         }
     }
@@ -136,20 +203,26 @@ impl LoadBalancer {
             return;
         }
 
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<hyper::body::Bytes>>();
-
         for backend in &self.backends {
             let health_url = format!("{}{}", backend.url, backend.health_check_path);
-            
-            match client.get(health_url.parse().unwrap()).await {
+
+            // Parse URL safely
+            let uri = match health_url.parse::<Uri>() {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Invalid health check URL {}: {}", health_url, e);
+                    continue;
+                }
+            };
+
+            match self.http_client.get(uri).await {
                 Ok(response) => {
                     let status = response.status();
                     let mut health = self.health_status.write().await;
-                    
+
                     if let Some(backend_health) = health.get_mut(&backend.url) {
                         backend_health.last_check = Some(Utc::now());
-                        
+
                         if status.is_success() {
                             if !backend_health.healthy {
                                 info!("Backend {} is now healthy", backend.url);
@@ -170,14 +243,17 @@ impl LoadBalancer {
                 Err(e) => {
                     debug!("Health check failed for {}: {}", backend.url, e);
                     let mut health = self.health_status.write().await;
-                    
+
                     if let Some(backend_health) = health.get_mut(&backend.url) {
                         backend_health.last_check = Some(Utc::now());
                         backend_health.failures += 1;
-                        
+
                         if backend_health.failures >= config.failure_threshold {
                             if backend_health.healthy {
-                                warn!("Backend {} marked as unhealthy due to connection failure", backend.url);
+                                warn!(
+                                    "Backend {} marked as unhealthy due to connection failure",
+                                    backend.url
+                                );
                             }
                             backend_health.healthy = false;
                         }
@@ -191,24 +267,41 @@ impl LoadBalancer {
 struct ProxyService {
     load_balancer: Arc<LoadBalancer>,
     config: Arc<Config>,
+    http_client: HttpClient,
 }
 
 impl ProxyService {
     fn new(config: Config) -> Self {
-        let load_balancer = Arc::new(LoadBalancer::new(config.backends.clone()));
+        let strategy = LoadBalancingStrategy::from_config(&config.load_balancing.strategy);
+        let connect_timeout = config.timeouts.connect_timeout_seconds;
+        let load_balancer = Arc::new(LoadBalancer::new(
+            config.backends.clone(),
+            strategy,
+            connect_timeout,
+        ));
         let config = Arc::new(config);
-        
+        let http_client = build_http_client(connect_timeout);
+
         Self {
             load_balancer,
             config,
+            http_client,
         }
     }
 
-    async fn handle_request(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<hyper::body::Bytes>>, anyhow::Error> {
+    async fn handle_request(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<Full<hyper::body::Bytes>>, anyhow::Error> {
         let start_time = Instant::now();
         let method = req.method().clone();
         let path = req.uri().path().to_string();
-        let path_and_query = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let headers = req.headers().clone();
         let remote_addr = "unknown"; // We'll get this from connection context in a real implementation
 
@@ -221,7 +314,9 @@ impl ProxyService {
                 error!("No healthy backends available");
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Full::new(hyper::body::Bytes::from("No healthy backends available")))
+                    .body(Full::new(hyper::body::Bytes::from(
+                        "No healthy backends available",
+                    )))
                     .unwrap());
             }
         };
@@ -239,10 +334,6 @@ impl ProxyService {
             }
         };
 
-        // Create the client
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<hyper::body::Bytes>>();
-
         // Collect the request body
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -250,7 +341,9 @@ impl ProxyService {
                 error!("Failed to read request body: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(hyper::body::Bytes::from("Failed to read request body")))
+                    .body(Full::new(hyper::body::Bytes::from(
+                        "Failed to read request body",
+                    )))
                     .unwrap());
             }
         };
@@ -269,30 +362,54 @@ impl ProxyService {
             }
         }
 
-        // Add X-Forwarded headers
-        proxy_req.headers_mut().insert("X-Forwarded-For", remote_addr.parse().unwrap());
-        proxy_req.headers_mut().insert("X-Forwarded-Proto", "http".parse().unwrap());
+        // Add X-Forwarded headers safely
+        if let Ok(forwarded_for) = remote_addr.parse() {
+            proxy_req
+                .headers_mut()
+                .insert("X-Forwarded-For", forwarded_for);
+        }
+        if let Ok(forwarded_proto) = "http".parse() {
+            proxy_req
+                .headers_mut()
+                .insert("X-Forwarded-Proto", forwarded_proto);
+        }
 
         // Send the request
         let response = match tokio::time::timeout(
             Duration::from_secs(self.config.timeouts.request_timeout_seconds),
-            client.request(proxy_req)
-        ).await {
+            self.http_client.request(proxy_req),
+        )
+        .await
+        {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
                 error!("Request to backend {} failed: {}", backend.url, e);
-                self.load_balancer.mark_backend_unhealthy(&backend.url).await;
+                self.load_balancer
+                    .mark_backend_unhealthy(
+                        &backend.url,
+                        self.config.health_checks.failure_threshold,
+                    )
+                    .await;
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(hyper::body::Bytes::from("Backend request failed")))
+                    .body(Full::new(hyper::body::Bytes::from(
+                        "Backend request failed",
+                    )))
                     .unwrap());
             }
             Err(_) => {
                 error!("Request to backend {} timed out", backend.url);
-                self.load_balancer.mark_backend_unhealthy(&backend.url).await;
+                self.load_balancer
+                    .mark_backend_unhealthy(
+                        &backend.url,
+                        self.config.health_checks.failure_threshold,
+                    )
+                    .await;
                 return Ok(Response::builder()
                     .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(Full::new(hyper::body::Bytes::from("Backend request timed out")))
+                    .body(Full::new(hyper::body::Bytes::from(
+                        "Backend request timed out",
+                    )))
                     .unwrap());
             }
         };
@@ -300,25 +417,32 @@ impl ProxyService {
         // Collect the response body
         let status = response.status();
         let headers = response.headers().clone();
-        
+
         let body_bytes = match response.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 error!("Failed to read response body: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(hyper::body::Bytes::from("Failed to read response from backend")))
+                    .body(Full::new(hyper::body::Bytes::from(
+                        "Failed to read response from backend",
+                    )))
                     .unwrap());
             }
         };
 
         let duration = start_time.elapsed();
-        info!("Request completed: {} {} -> {} ({:.2}ms)", 
-              method, path, status, duration.as_millis());
+        info!(
+            "Request completed: {} {} -> {} ({:.2}ms)",
+            method,
+            path,
+            status,
+            duration.as_millis()
+        );
 
         // Build the response
         let mut response_builder = Response::builder().status(status);
-        
+
         // Copy response headers
         for (name, value) in headers {
             if let Some(name) = name {
@@ -326,19 +450,17 @@ impl ProxyService {
             }
         }
 
-        Ok(response_builder
-            .body(Full::new(body_bytes))
-            .unwrap())
+        Ok(response_builder.body(Full::new(body_bytes)).unwrap())
     }
 }
 
 fn load_config() -> Result<Config> {
-    let config_content = std::fs::read_to_string("config.yaml")
-        .context("Failed to read config.yaml")?;
-    
-    let config: Config = serde_yaml::from_str(&config_content)
-        .context("Failed to parse config.yaml")?;
-    
+    let config_content =
+        std::fs::read_to_string("config.yaml").context("Failed to read config.yaml")?;
+
+    let config: Config =
+        serde_yaml::from_str(&config_content).context("Failed to parse config.yaml")?;
+
     Ok(config)
 }
 
@@ -360,21 +482,25 @@ fn setup_logging(config: &LoggingConfig) {
 async fn main() -> Result<()> {
     // Load configuration
     let config = load_config()?;
-    
+
     // Setup logging
     setup_logging(&config.logging);
-    
+
     info!("Starting reverse proxy server...");
-    info!("Configuration loaded: {} backends configured", config.backends.len());
-    
+    info!(
+        "Configuration loaded: {} backends configured",
+        config.backends.len()
+    );
+
     // Create the proxy service
     let proxy_service = Arc::new(ProxyService::new(config.clone()));
-    
+
     // Start health check task
     let health_check_service = proxy_service.load_balancer.clone();
     let health_config = config.health_checks.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(health_config.interval_seconds));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(health_config.interval_seconds));
         loop {
             interval.tick().await;
             health_check_service.health_check(&health_config).await;
@@ -383,9 +509,10 @@ async fn main() -> Result<()> {
 
     // Bind to the configured address
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = TcpListener::bind(&addr).await
+    let listener = TcpListener::bind(&addr)
+        .await
         .context(format!("Failed to bind to {}", addr))?;
-    
+
     info!("Reverse proxy listening on http://{}", addr);
     info!("Backend servers:");
     for backend in &config.backends {
@@ -400,10 +527,13 @@ async fn main() -> Result<()> {
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(move |req| {
-                    let service = proxy_service.clone();
-                    async move { service.handle_request(req).await }
-                }))
+                .serve_connection(
+                    io,
+                    service_fn(move |req| {
+                        let service = proxy_service.clone();
+                        async move { service.handle_request(req).await }
+                    }),
+                )
                 .await
             {
                 error!("Error serving connection: {:?}", err);
