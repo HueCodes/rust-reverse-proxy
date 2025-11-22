@@ -13,6 +13,9 @@ use log::{info, warn, error, debug};
 use serde::Deserialize;
 use chrono::{DateTime, Utc};
 
+// Allow dead code for configuration fields that may be used in future features
+#[allow(dead_code)]
+
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     server: ServerConfig,
@@ -74,6 +77,7 @@ struct LoadBalancer {
     backends: Vec<Backend>,
     health_status: Arc<tokio::sync::RwLock<HashMap<String, BackendHealth>>>,
     round_robin_counter: AtomicUsize,
+    http_client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Full<hyper::body::Bytes>>,
 }
 
 impl LoadBalancer {
@@ -93,10 +97,15 @@ impl LoadBalancer {
             }
         }
 
+        // Create reusable HTTP client
+        let http_client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http::<Full<hyper::body::Bytes>>();
+
         Self {
             backends,
             health_status,
             round_robin_counter: AtomicUsize::new(0),
+            http_client,
         }
     }
 
@@ -120,11 +129,11 @@ impl LoadBalancer {
         Some(healthy_backends[index].clone())
     }
 
-    async fn mark_backend_unhealthy(&self, url: &str) {
+    async fn mark_backend_unhealthy(&self, url: &str, failure_threshold: u32) {
         let mut health = self.health_status.write().await;
         if let Some(backend_health) = health.get_mut(url) {
             backend_health.failures += 1;
-            if backend_health.failures >= 3 {
+            if backend_health.failures >= failure_threshold {
                 backend_health.healthy = false;
                 warn!("Backend {} marked as unhealthy after {} failures", url, backend_health.failures);
             }
@@ -136,13 +145,19 @@ impl LoadBalancer {
             return;
         }
 
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<hyper::body::Bytes>>();
-
         for backend in &self.backends {
             let health_url = format!("{}{}", backend.url, backend.health_check_path);
             
-            match client.get(health_url.parse().unwrap()).await {
+            // Parse URL safely
+            let uri = match health_url.parse::<Uri>() {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Invalid health check URL {}: {}", health_url, e);
+                    continue;
+                }
+            };
+            
+            match self.http_client.get(uri).await {
                 Ok(response) => {
                     let status = response.status();
                     let mut health = self.health_status.write().await;
@@ -191,6 +206,7 @@ impl LoadBalancer {
 struct ProxyService {
     load_balancer: Arc<LoadBalancer>,
     config: Arc<Config>,
+    http_client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Full<hyper::body::Bytes>>,
 }
 
 impl ProxyService {
@@ -198,9 +214,14 @@ impl ProxyService {
         let load_balancer = Arc::new(LoadBalancer::new(config.backends.clone()));
         let config = Arc::new(config);
         
+        // Create reusable HTTP client
+        let http_client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http::<Full<hyper::body::Bytes>>();
+        
         Self {
             load_balancer,
             config,
+            http_client,
         }
     }
 
@@ -239,10 +260,6 @@ impl ProxyService {
             }
         };
 
-        // Create the client
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<hyper::body::Bytes>>();
-
         // Collect the request body
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -269,19 +286,23 @@ impl ProxyService {
             }
         }
 
-        // Add X-Forwarded headers
-        proxy_req.headers_mut().insert("X-Forwarded-For", remote_addr.parse().unwrap());
-        proxy_req.headers_mut().insert("X-Forwarded-Proto", "http".parse().unwrap());
+        // Add X-Forwarded headers safely
+        if let Ok(forwarded_for) = remote_addr.parse() {
+            proxy_req.headers_mut().insert("X-Forwarded-For", forwarded_for);
+        }
+        if let Ok(forwarded_proto) = "http".parse() {
+            proxy_req.headers_mut().insert("X-Forwarded-Proto", forwarded_proto);
+        }
 
         // Send the request
         let response = match tokio::time::timeout(
             Duration::from_secs(self.config.timeouts.request_timeout_seconds),
-            client.request(proxy_req)
+            self.http_client.request(proxy_req)
         ).await {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
                 error!("Request to backend {} failed: {}", backend.url, e);
-                self.load_balancer.mark_backend_unhealthy(&backend.url).await;
+                self.load_balancer.mark_backend_unhealthy(&backend.url, self.config.health_checks.failure_threshold).await;
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .body(Full::new(hyper::body::Bytes::from("Backend request failed")))
@@ -289,7 +310,7 @@ impl ProxyService {
             }
             Err(_) => {
                 error!("Request to backend {} timed out", backend.url);
-                self.load_balancer.mark_backend_unhealthy(&backend.url).await;
+                self.load_balancer.mark_backend_unhealthy(&backend.url, self.config.health_checks.failure_threshold).await;
                 return Ok(Response::builder()
                     .status(StatusCode::GATEWAY_TIMEOUT)
                     .body(Full::new(hyper::body::Bytes::from("Backend request timed out")))
