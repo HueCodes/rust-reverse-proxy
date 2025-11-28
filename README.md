@@ -5,7 +5,7 @@ A lightweight, high-performance HTTP reverse proxy written in Rust, prioritizing
 ## Features
 
 - **High Performance**: Built with Tokio and Hyper for maximum throughput
-- **Load Balancing**: Round-robin load balancing across multiple backend servers
+- **Load Balancing**: Round-robin and weighted round-robin across healthy backends
 - **Health Checks**: Automatic health monitoring of backend servers
 - **Configuration-Driven**: YAML-based configuration for easy management
 - **Structured Logging**: Comprehensive request/response logging with configurable levels
@@ -58,7 +58,7 @@ backends:
     health_check_path: "/"
 
 load_balancing:
-  strategy: "round_robin"  # Load balancing strategy
+  strategy: "round_robin"  # round_robin or weighted_round_robin
 
 health_checks:
   enabled: true           # Enable/disable health checks
@@ -86,10 +86,10 @@ The proxy consists of several key components:
 
 ## Load Balancing
 
-Currently supports round-robin load balancing:
-- Requests are distributed evenly across healthy backends
-- Unhealthy backends are automatically excluded
-- Backends are marked unhealthy after consecutive failures
+Supports both round-robin and weighted round-robin strategies:
+- Round-robin distributes requests evenly across healthy backends
+- Weighted round-robin honors configured weights for skewed traffic
+- Unhealthy backends are automatically excluded until they recover
 
 ## Health Checks
 

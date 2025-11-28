@@ -11,7 +11,7 @@ backends:
     health_check_path: "/"
 
 load_balancing:
-  strategy: "round_robin"  # round_robin, weighted_round_robin, least_connections
+  strategy: "round_robin"  # round_robin or weighted_round_robin
 
 health_checks:
   enabled: true

@@ -12,7 +12,7 @@ backends:
     health_check_path: "/posts/1"
 
 load_balancing:
-  strategy: "round_robin"
+  strategy: "round_robin"  # round_robin or weighted_round_robin
 
 health_checks:
   enabled: true

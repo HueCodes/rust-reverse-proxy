@@ -10,6 +10,7 @@ use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,6 +106,12 @@ struct LoadBalancer {
     round_robin_counter: AtomicUsize,
     strategy: LoadBalancingStrategy,
     http_client: HttpClient,
+}
+
+#[derive(Debug)]
+enum HealthProbeError {
+    Timeout,
+    Transport(String),
 }
 
 impl LoadBalancer {
@@ -215,7 +222,26 @@ impl LoadBalancer {
                 }
             };
 
-            match self.http_client.get(uri).await {
+            let request_future = self.http_client.get(uri);
+            let response_result = if config.timeout_seconds > 0 {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.timeout_seconds),
+                    request_future,
+                )
+                .await
+                {
+                    Ok(inner_result) => {
+                        inner_result.map_err(|err| HealthProbeError::Transport(err.to_string()))
+                    }
+                    Err(_) => Err(HealthProbeError::Timeout),
+                }
+            } else {
+                request_future
+                    .await
+                    .map_err(|err| HealthProbeError::Transport(err.to_string()))
+            };
+
+            match response_result {
                 Ok(response) => {
                     let status = response.status();
                     let mut health = self.health_status.write().await;
@@ -240,8 +266,19 @@ impl LoadBalancer {
                         }
                     }
                 }
-                Err(e) => {
-                    debug!("Health check failed for {}: {}", backend.url, e);
+                Err(error) => {
+                    match error {
+                        HealthProbeError::Timeout => {
+                            debug!(
+                                "Health check timed out for {} after {}s",
+                                backend.url, config.timeout_seconds
+                            );
+                        }
+                        HealthProbeError::Transport(e) => {
+                            debug!("Health check failed for {}: {}", backend.url, e);
+                        }
+                    }
+
                     let mut health = self.health_status.write().await;
 
                     if let Some(backend_health) = health.get_mut(&backend.url) {
@@ -465,7 +502,8 @@ fn load_config() -> Result<Config> {
 }
 
 fn setup_logging(config: &LoggingConfig) {
-    let log_level = match config.level.as_str() {
+    let level_key = config.level.to_lowercase();
+    let log_level = match level_key.as_str() {
         "debug" => log::LevelFilter::Debug,
         "info" => log::LevelFilter::Info,
         "warn" => log::LevelFilter::Warn,
@@ -473,9 +511,23 @@ fn setup_logging(config: &LoggingConfig) {
         _ => log::LevelFilter::Info,
     };
 
-    env_logger::Builder::from_default_env()
-        .filter_level(log_level)
-        .init();
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.filter_level(log_level);
+
+    if config.format.eq_ignore_ascii_case("json") {
+        builder.format(|buf, record| {
+            let timestamp = Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
+                "timestamp": timestamp,
+                "level": record.level().to_string(),
+                "target": record.target(),
+                "message": record.args().to_string(),
+            });
+            writeln!(buf, "{}", payload)
+        });
+    }
+
+    builder.init();
 }
 
 #[tokio::main]
