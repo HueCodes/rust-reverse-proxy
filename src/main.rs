@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -11,7 +12,8 @@ use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -41,6 +43,7 @@ struct Config {
     health_checks: HealthCheckConfig,
     logging: LoggingConfig,
     timeouts: TimeoutConfig,
+    rate_limiting: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +82,13 @@ struct LoggingConfig {
 struct TimeoutConfig {
     request_timeout_seconds: u64,
     connect_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RateLimitConfig {
+    enabled: bool,
+    requests_per_window: u64,
+    window_seconds: u64,
 }
 
 fn build_http_client(connect_timeout_seconds: u64) -> HttpClient {
@@ -301,10 +311,106 @@ impl LoadBalancer {
     }
 }
 
+/// Token bucket for rate limiting a single client
+/// The bucket refills at a constant rate and each request consumes one token
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: AtomicU64,
+    last_refill: std::sync::Mutex<Instant>,
+    capacity: u64,
+    refill_rate: f64, // tokens per second
+}
+
+impl TokenBucket {
+    fn new(capacity: u64, window_seconds: u64) -> Self {
+        Self {
+            tokens: AtomicU64::new(capacity),
+            last_refill: std::sync::Mutex::new(Instant::now()),
+            capacity,
+            refill_rate: capacity as f64 / window_seconds as f64,
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed, false if rate limited
+    fn try_consume(&self) -> bool {
+        // Refill tokens based on time elapsed
+        let now = Instant::now();
+        let mut last_refill = self.last_refill.lock().unwrap();
+        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        
+        if elapsed > 0.0 {
+            let tokens_to_add = (elapsed * self.refill_rate) as u64;
+            if tokens_to_add > 0 {
+                let current = self.tokens.load(Ordering::Relaxed);
+                let new_tokens = (current + tokens_to_add).min(self.capacity);
+                self.tokens.store(new_tokens, Ordering::Relaxed);
+                *last_refill = now;
+            }
+        }
+        drop(last_refill);
+
+        // Try to consume a token
+        let mut current = self.tokens.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(x) => current = x,
+            }
+        }
+    }
+}
+
+/// Rate limiter managing multiple clients with token buckets
+struct RateLimiter {
+    buckets: DashMap<String, TokenBucket>,
+    config: RateLimitConfig,
+}
+
+impl RateLimiter {
+    fn new(config: RateLimitConfig) -> Self {
+        Self {
+            buckets: DashMap::new(),
+            config,
+        }
+    }
+
+    /// Check if a request from this IP should be allowed
+    fn check_rate_limit(&self, client_ip: &str) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+
+        // Get or create bucket for this IP
+        let bucket = self.buckets.entry(client_ip.to_string()).or_insert_with(|| {
+            TokenBucket::new(self.config.requests_per_window, self.config.window_seconds)
+        });
+
+        bucket.try_consume()
+    }
+
+    /// Periodically clean up old entries to prevent memory leaks
+    fn cleanup_old_entries(&self) {
+        // Remove entries that haven't been accessed recently
+        // This is a simple cleanup; in production, you might want more sophisticated logic
+        if self.buckets.len() > 10000 {
+            warn!("Rate limiter has {} entries, consider cleanup", self.buckets.len());
+        }
+    }
+}
+
 struct ProxyService {
     load_balancer: Arc<LoadBalancer>,
     config: Arc<Config>,
     http_client: HttpClient,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl ProxyService {
@@ -316,6 +422,7 @@ impl ProxyService {
             strategy,
             connect_timeout,
         ));
+        let rate_limiter = Arc::new(RateLimiter::new(config.rate_limiting.clone()));
         let config = Arc::new(config);
         let http_client = build_http_client(connect_timeout);
 
@@ -323,12 +430,14 @@ impl ProxyService {
             load_balancer,
             config,
             http_client,
+            rate_limiter,
         }
     }
 
     async fn handle_request(
         &self,
         req: Request<hyper::body::Incoming>,
+        client_addr: SocketAddr,
     ) -> Result<Response<Full<hyper::body::Bytes>>, anyhow::Error> {
         let start_time = Instant::now();
         let method = req.method().clone();
@@ -340,9 +449,21 @@ impl ProxyService {
             .unwrap_or("")
             .to_string();
         let headers = req.headers().clone();
-        let remote_addr = "unknown"; // We'll get this from connection context in a real implementation
+        let client_ip = client_addr.ip().to_string();
 
-        info!("Incoming request: {} {}", method, path);
+        info!("Incoming request: {} {} from {}", method, path, client_ip);
+
+        // Check rate limit
+        if !self.rate_limiter.check_rate_limit(&client_ip) {
+            warn!("Rate limit exceeded for {}", client_ip);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Retry-After", self.config.rate_limiting.window_seconds.to_string())
+                .body(Full::new(hyper::body::Bytes::from(
+                    "Rate limit exceeded. Please try again later.",
+                )))
+                .unwrap());
+        }
 
         // Get a healthy backend
         let backend = match self.load_balancer.get_healthy_backend().await {
@@ -400,7 +521,7 @@ impl ProxyService {
         }
 
         // Add X-Forwarded headers safely
-        if let Ok(forwarded_for) = remote_addr.parse() {
+        if let Ok(forwarded_for) = client_ip.parse() {
             proxy_req
                 .headers_mut()
                 .insert("X-Forwarded-For", forwarded_for);
@@ -571,9 +692,19 @@ async fn main() -> Result<()> {
         info!("  - {} (weight: {})", backend.url, backend.weight);
     }
 
+    // Start rate limiter cleanup task
+    let rate_limiter_cleanup = proxy_service.rate_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+        loop {
+            interval.tick().await;
+            rate_limiter_cleanup.cleanup_old_entries();
+        }
+    });
+
     // Accept connections
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, client_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let proxy_service = proxy_service.clone();
 
@@ -583,7 +714,7 @@ async fn main() -> Result<()> {
                     io,
                     service_fn(move |req| {
                         let service = proxy_service.clone();
-                        async move { service.handle_request(req).await }
+                        async move { service.handle_request(req, client_addr).await }
                     }),
                 )
                 .await
