@@ -109,6 +109,21 @@ struct BackendHealth {
     last_check: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct HealthResponse {
+    status: String,
+    uptime_seconds: u64,
+    backends: Vec<BackendStatus>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BackendStatus {
+    url: String,
+    healthy: bool,
+    failures: u32,
+    last_check: Option<String>,
+}
+
 #[derive(Debug)]
 struct LoadBalancer {
     backends: Vec<Backend>,
@@ -411,6 +426,7 @@ struct ProxyService {
     config: Arc<Config>,
     http_client: HttpClient,
     rate_limiter: Arc<RateLimiter>,
+    start_time: Instant,
 }
 
 impl ProxyService {
@@ -431,6 +447,7 @@ impl ProxyService {
             config,
             http_client,
             rate_limiter,
+            start_time: Instant::now(),
         }
     }
 
@@ -452,6 +469,11 @@ impl ProxyService {
         let client_ip = client_addr.ip().to_string();
 
         info!("Incoming request: {} {} from {}", method, path, client_ip);
+
+        // Handle health check endpoint
+        if path == "/health" {
+            return self.handle_health_check().await;
+        }
 
         // Check rate limit
         if !self.rate_limiter.check_rate_limit(&client_ip) {
@@ -609,6 +631,48 @@ impl ProxyService {
         }
 
         Ok(response_builder.body(Full::new(body_bytes)).unwrap())
+    }
+
+    async fn handle_health_check(
+        &self,
+    ) -> Result<Response<Full<hyper::body::Bytes>>, anyhow::Error> {
+        let uptime = self.start_time.elapsed().as_secs();
+        let health_status = self.load_balancer.health_status.read().await;
+
+        let mut backends = Vec::new();
+        for backend in &self.load_balancer.backends {
+            if let Some(health) = health_status.get(&backend.url) {
+                backends.push(BackendStatus {
+                    url: backend.url.clone(),
+                    healthy: health.healthy,
+                    failures: health.failures,
+                    last_check: health.last_check.map(|dt| dt.to_rfc3339()),
+                });
+            } else {
+                backends.push(BackendStatus {
+                    url: backend.url.clone(),
+                    healthy: true,
+                    failures: 0,
+                    last_check: None,
+                });
+            }
+        }
+
+        let all_healthy = backends.iter().any(|b| b.healthy);
+        let response = HealthResponse {
+            status: if all_healthy { "healthy".to_string() } else { "unhealthy".to_string() },
+            uptime_seconds: uptime,
+            backends,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .context("Failed to serialize health response")?;
+
+        Ok(Response::builder()
+            .status(if all_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE })
+            .header("Content-Type", "application/json")
+            .body(Full::new(hyper::body::Bytes::from(json)))
+            .unwrap())
     }
 }
 
