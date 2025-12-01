@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 type HttpClient = hyper_util::client::legacy::Client<HttpConnector, Full<Bytes>>;
 
@@ -467,8 +468,12 @@ impl ProxyService {
             .to_string();
         let headers = req.headers().clone();
         let client_ip = client_addr.ip().to_string();
+        let request_id = Uuid::new_v4().to_string();
 
-        info!("Incoming request: {} {} from {}", method, path, client_ip);
+        info!(
+            "[{}] Request started: {} {} from {}",
+            request_id, method, path, client_ip
+        );
 
         // Handle health check endpoint
         if path == "/health" {
@@ -477,10 +482,11 @@ impl ProxyService {
 
         // Check rate limit
         if !self.rate_limiter.check_rate_limit(&client_ip) {
-            warn!("Rate limit exceeded for {}", client_ip);
+            warn!("[{}] Rate limit exceeded for {}", request_id, client_ip);
             return Ok(Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("Retry-After", self.config.rate_limiting.window_seconds.to_string())
+                .header("X-Request-ID", &request_id)
                 .body(Full::new(hyper::body::Bytes::from(
                     "Rate limit exceeded. Please try again later.",
                 )))
@@ -491,9 +497,10 @@ impl ProxyService {
         let backend = match self.load_balancer.get_healthy_backend().await {
             Some(backend) => backend,
             None => {
-                error!("No healthy backends available");
+                error!("[{}] No healthy backends available", request_id);
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from(
                         "No healthy backends available",
                     )))
@@ -506,9 +513,10 @@ impl ProxyService {
         let uri = match target_uri.parse::<Uri>() {
             Ok(uri) => uri,
             Err(e) => {
-                error!("Invalid target URI {}: {}", target_uri, e);
+                error!("[{}] Invalid target URI {}: {}", request_id, target_uri, e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from("Invalid target URL")))
                     .unwrap());
             }
@@ -518,15 +526,19 @@ impl ProxyService {
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to read request body: {}", e);
+                error!("[{}] Failed to read request body: {}", request_id, e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from(
                         "Failed to read request body",
                     )))
                     .unwrap());
             }
         };
+
+        let request_size = body_bytes.len();
+        debug!("[{}] Request body size: {} bytes", request_id, request_size);
 
         // Create a new request
         let mut proxy_req = Request::builder()
@@ -553,6 +565,9 @@ impl ProxyService {
                 .headers_mut()
                 .insert("X-Forwarded-Proto", forwarded_proto);
         }
+        if let Ok(req_id) = request_id.parse() {
+            proxy_req.headers_mut().insert("X-Request-ID", req_id);
+        }
 
         // Send the request
         let response = match tokio::time::timeout(
@@ -563,7 +578,10 @@ impl ProxyService {
         {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
-                error!("Request to backend {} failed: {}", backend.url, e);
+                error!(
+                    "[{}] Request to backend {} failed: {}",
+                    request_id, backend.url, e
+                );
                 self.load_balancer
                     .mark_backend_unhealthy(
                         &backend.url,
@@ -572,13 +590,17 @@ impl ProxyService {
                     .await;
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from(
                         "Backend request failed",
                     )))
                     .unwrap());
             }
             Err(_) => {
-                error!("Request to backend {} timed out", backend.url);
+                error!(
+                    "[{}] Request to backend {} timed out",
+                    request_id, backend.url
+                );
                 self.load_balancer
                     .mark_backend_unhealthy(
                         &backend.url,
@@ -587,6 +609,7 @@ impl ProxyService {
                     .await;
                 return Ok(Response::builder()
                     .status(StatusCode::GATEWAY_TIMEOUT)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from(
                         "Backend request timed out",
                     )))
@@ -601,9 +624,10 @@ impl ProxyService {
         let body_bytes = match response.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to read response body: {}", e);
+                error!("[{}] Failed to read response body: {}", request_id, e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
+                    .header("X-Request-ID", &request_id)
                     .body(Full::new(hyper::body::Bytes::from(
                         "Failed to read response from backend",
                     )))
@@ -611,17 +635,24 @@ impl ProxyService {
             }
         };
 
+        let response_size = body_bytes.len();
         let duration = start_time.elapsed();
         info!(
-            "Request completed: {} {} -> {} ({:.2}ms)",
+            "[{}] Request completed: {} {} -> {} ({:.2}ms, req: {}B, res: {}B, backend: {})",
+            request_id,
             method,
             path,
             status,
-            duration.as_millis()
+            duration.as_millis(),
+            request_size,
+            response_size,
+            backend.url
         );
 
         // Build the response
-        let mut response_builder = Response::builder().status(status);
+        let mut response_builder = Response::builder()
+            .status(status)
+            .header("X-Request-ID", &request_id);
 
         // Copy response headers
         for (name, value) in headers {
