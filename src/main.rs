@@ -651,6 +651,34 @@ fn setup_logging(config: &LoggingConfig) {
     builder.init();
 }
 
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received, starting graceful shutdown...");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
@@ -668,15 +696,26 @@ async fn main() -> Result<()> {
     // Create the proxy service
     let proxy_service = Arc::new(ProxyService::new(config.clone()));
 
+    // Create shutdown channel
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
     // Start health check task
     let health_check_service = proxy_service.load_balancer.clone();
     let health_config = config.health_checks.clone();
+    let mut shutdown_rx_health = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(health_config.interval_seconds));
         loop {
-            interval.tick().await;
-            health_check_service.health_check(&health_config).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    health_check_service.health_check(&health_config).await;
+                }
+                _ = shutdown_rx_health.recv() => {
+                    info!("Health check task shutting down");
+                    break;
+                }
+            }
         }
     });
 
@@ -694,33 +733,62 @@ async fn main() -> Result<()> {
 
     // Start rate limiter cleanup task
     let rate_limiter_cleanup = proxy_service.rate_limiter.clone();
+    let mut shutdown_rx_ratelimit = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
         loop {
-            interval.tick().await;
-            rate_limiter_cleanup.cleanup_old_entries();
+            tokio::select! {
+                _ = interval.tick() => {
+                    rate_limiter_cleanup.cleanup_old_entries();
+                }
+                _ = shutdown_rx_ratelimit.recv() => {
+                    info!("Rate limiter cleanup task shutting down");
+                    break;
+                }
+            }
         }
     });
 
-    // Accept connections
+    // Accept connections with graceful shutdown
     loop {
-        let (stream, client_addr) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let proxy_service = proxy_service.clone();
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, client_addr)) => {
+                        let io = TokioIo::new(stream);
+                        let proxy_service = proxy_service.clone();
 
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| {
-                        let service = proxy_service.clone();
-                        async move { service.handle_request(req, client_addr).await }
-                    }),
-                )
-                .await
-            {
-                error!("Error serving connection: {:?}", err);
+                        tokio::task::spawn(async move {
+                            if let Err(err) = http1::Builder::new()
+                                .serve_connection(
+                                    io,
+                                    service_fn(move |req| {
+                                        let service = proxy_service.clone();
+                                        async move { service.handle_request(req, client_addr).await }
+                                    }),
+                                )
+                                .await
+                            {
+                                error!("Error serving connection: {:?}", err);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
-        });
+            _ = shutdown_signal() => {
+                info!("Shutting down gracefully...");
+                // Notify all background tasks to shut down
+                let _ = shutdown_tx.send(());
+                // Give tasks time to finish
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                info!("Shutdown complete");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
