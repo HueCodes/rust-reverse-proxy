@@ -157,24 +157,4 @@ EXPOSE 3000
 CMD ["reverse_proxy"]
 ```
 
-## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Roadmap
-
-- [ ] HTTPS/TLS termination support
-- [ ] WebSocket proxying
-- [ ] Metrics and monitoring endpoints
-- [ ] Rate limiting
-- [ ] Path-based routing
-- [ ] Circuit breaker pattern
-- [ ] Admin API for runtime configuration
