@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # Reverse Proxy
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rust-reverse-proxy
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - proxy-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    environment:
+      - CONFIG_PATH=/etc/reverse-proxy/config.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # Backend Service 1
+  backend1:
+    build:
+      context: ./backends/backend1
+      dockerfile: Dockerfile
+    container_name: backend1
+    expose:
+      - "8001"
+    restart: unless-stopped
+    networks:
+      - proxy-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+  # Backend Service 2
+  backend2:
+    build:
+      context: ./backends/backend2
+      dockerfile: Dockerfile
+    container_name: backend2
+    expose:
+      - "8002"
+    restart: unless-stopped
+    networks:
+      - proxy-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+networks:
+  proxy-network:
+    driver: bridge

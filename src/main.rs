@@ -146,22 +146,19 @@ impl LoadBalancer {
         strategy: LoadBalancingStrategy,
         connect_timeout_seconds: u64,
     ) -> Self {
-        let health_status = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-
         // Initialize health status for all backends
-        {
-            let mut health = health_status.blocking_write();
-            for backend in &backends {
-                health.insert(
-                    backend.url.clone(),
-                    BackendHealth {
-                        healthy: true, // Assume healthy initially
-                        failures: 0,
-                        last_check: None,
-                    },
-                );
-            }
+        let mut initial_health = HashMap::new();
+        for backend in &backends {
+            initial_health.insert(
+                backend.url.clone(),
+                BackendHealth {
+                    healthy: true, // Assume healthy initially
+                    failures: 0,
+                    last_check: None,
+                },
+            );
         }
+        let health_status = Arc::new(tokio::sync::RwLock::new(initial_health));
 
         // Create reusable HTTP client
         let http_client = build_http_client(connect_timeout_seconds);
@@ -708,8 +705,11 @@ impl ProxyService {
 }
 
 fn load_config() -> Result<Config> {
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
+
     let config_content =
-        std::fs::read_to_string("config.yaml").context("Failed to read config.yaml")?;
+        std::fs::read_to_string(&config_path)
+            .context(format!("Failed to read config file: {}", config_path))?;
 
     let config: Config =
         serde_yaml::from_str(&config_content).context("Failed to parse config.yaml")?;
